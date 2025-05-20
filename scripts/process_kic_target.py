@@ -7,22 +7,39 @@ import lightkurve as lk
 from controllers.light_curve.dip_array import get_lightcurve_deviation_array
 import json
 import time
-import signal
-from contextlib import contextmanager
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-class TimeoutException(Exception):
+class DownloadTimeoutError(Exception):
     pass
 
-@contextmanager
-def time_limit(seconds):
-    def signal_handler(signum, frame):
-        raise TimeoutException("Timed out!")
-    signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
+def download_with_timeout(lc_file, timeout):
+    """Download a light curve file with timeout handling using threads."""
+    result = {"success": False, "lc": None, "error": None}
+    
+    def _download():
+        try:
+            result["lc"] = lc_file.download()
+            result["success"] = True
+        except Exception as e:
+            result["error"] = str(e)
+    
+    # Start download in a separate thread
+    thread = threading.Thread(target=_download)
+    thread.daemon = True
+    thread.start()
+    
+    # Wait for the thread to complete or timeout
+    thread.join(timeout)
+    
+    if thread.is_alive():
+        # If thread is still alive after timeout, it's still downloading
+        return False, None, "Download timed out"
+    
+    if result["success"]:
+        return True, result["lc"], None
+    else:
+        return False, None, result["error"]
 
 def process_kic_target(kic_number, timeout=120, max_files=None):
     """
@@ -75,29 +92,23 @@ def process_kic_target(kic_number, timeout=120, max_files=None):
         try:
             print(f"Downloading file {i+1}/{len(search_result)}")
             
-            # Download the file with timeout
+            # Download the file with timeout using threads
             start_time = time.time()
-            try:
-                with time_limit(timeout):
-                    # Download the file - this will create a nested directory structure
-                    lc = lc_file.download()
-                    download_time = time.time() - start_time
-                    print(f"Download completed in {download_time:.1f} seconds")
-                    
-                    # The actual file path is stored in lc.filename
-                    fits_path = Path(lc.filename)
-                    
-                    if not fits_path.exists():
-                        print(f"Downloaded file not found at {fits_path}, skipping")
-                        metadata["skipped_files"] += 1
-                        continue
-                        
-            except TimeoutException:
-                print(f"Download timed out after {timeout} seconds, skipping file")
+            success, lc, error = download_with_timeout(lc_file, timeout)
+            
+            if not success:
+                print(f"Download error: {error}, skipping file")
                 metadata["skipped_files"] += 1
                 continue
-            except Exception as e:
-                print(f"Download error: {e}, skipping file")
+                
+            download_time = time.time() - start_time
+            print(f"Download completed in {download_time:.1f} seconds")
+            
+            # The actual file path is stored in lc.filename
+            fits_path = Path(lc.filename)
+            
+            if not fits_path.exists():
+                print(f"Downloaded file not found at {fits_path}, skipping")
                 metadata["skipped_files"] += 1
                 continue
             
